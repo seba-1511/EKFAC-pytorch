@@ -1,4 +1,4 @@
-# KFAC and EKFAC Preconditioners for Pytorch 
+# KFAC and EKFAC Preconditioners for Pytorch
 This repo contains a Pytorch implementation of the KFAC and EKFAC preconditioners.
 
 To use them, first initialize a preconditioner:

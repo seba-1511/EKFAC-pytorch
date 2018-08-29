@@ -182,7 +182,7 @@ class KFAC(Optimizer):
         return ixxt, iggt
 
     def _get_gathering_filter(self, mod):
-        """Convolution filter that extract input patches."""
+        """Convolution filter that extracts input patches."""
         kw, kh = mod.kernel_size
         g_filter = mod.weight.data.new(kw * kh * mod.in_channels, 1, kw, kh)
         g_filter.fill_(0)
