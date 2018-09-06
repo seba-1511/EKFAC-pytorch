@@ -83,15 +83,10 @@ class EKFAC(Optimizer):
                     if group['layer_type'] == 'Conv2d':
                         varD = torch.ger(eg, ex).unsqueeze_(2).unsqueeze_(3)
                         state['varD'] = varD.expand_as(weight)
-                        state['ED'] = torch.zeros_like(state['varD'])
-                        eps = torch.ger(eg + self.eps, ex + self.eps)
-                        eps = eps.unsqueeze_(2).unsqueeze_(3)
-                        state['eps'] = eps.expand_as(weight) - state['varD']
                     elif group['layer_type'] in ['Linear']:
                         state['varD'] = torch.ger(eg, ex)
-                        eps = torch.ger(eg + self.eps, ex + self.eps)
-                        state['ED'] = torch.zeros_like(state['varD'])
-                        state['eps'] = eps - state['varD']
+                    state['ED'] = torch.zeros_like(state['varD'])
+                    state['eps'] = self.eps ** 2
 
                 # Preconditionning
                 if update_params:
