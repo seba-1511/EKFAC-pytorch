@@ -60,7 +60,8 @@ class KFAC(Optimizer):
             # Update convariances and inverses
             if self._iteration_counter % self.update_freq == 0:
                 self._compute_covs(group, state)
-                ixxt, iggt = self._inv_covs(state['xxt'], state['ggt'])
+                ixxt, iggt = self._inv_covs(state['xxt'], state['ggt'],
+                                            state['num_locations'])
                 state['ixxt'] = ixxt
                 state['iggt'] = iggt
             else:
@@ -92,6 +93,8 @@ class KFAC(Optimizer):
             gb = bias.grad.data
             g = torch.cat([g, gb.view(gb.shape[0], 1)], dim=1)
         g = torch.mm(torch.mm(iggt, g), ixxt)
+        if group['layer_type'] == 'Conv2d':
+            g /= state['num_locations']
         if bias is not None:
             gb = g[:, -1].contiguous().view(*bias.shape)
             bias.grad.data = gb
@@ -121,6 +124,7 @@ class KFAC(Optimizer):
         g = torch.mm(ixxt, g.contiguous().view(-1, s[0]*s[2]*s[3]))
         g = g.view(-1, s[0], s[2], s[3]).permute(1, 0, 2, 3).contiguous()
         g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
+        g /= state['num_locations']
         if bias is not None:
             gb = g[:, -1, s[2]//2, s[3]//2]
             bias.grad.data = gb
@@ -154,27 +158,30 @@ class KFAC(Optimizer):
         # Computation of ggt
         if group['layer_type'] == 'Conv2d':
             gy = gy.data.permute(1, 0, 2, 3)
+            state['num_locations'] = gy.shape[2] * gy.shape[3]
             gy = gy.contiguous().view(gy.shape[0], -1)
         else:
             gy = gy.data.t()
+            state['num_locations'] = 1
         if self._iteration_counter == 0:
-            state['ggt'] = torch.mm(gy, gy.t()) / float(bs)
+            state['ggt'] = torch.mm(gy, gy.t()) / float(gy.shape[1])
         else:
             state['ggt'].addmm_(mat1=gy, mat2=gy.t(),
                                 beta=(1. - self.alpha),
-                                alpha=self.alpha / float(bs))
+                                alpha=self.alpha / float(gy.shape[1]))
 
-    def _inv_covs(self, xxt, ggt):
+    def _inv_covs(self, xxt, ggt, num_locations):
         """Inverses the covariances."""
         # Computes pi
         pi = 1.0
         if self.pi:
-            tx = torch.trace(xxt) / float(xxt.shape[0])
-            tg = torch.trace(ggt) / float(ggt.shape[0])
-            pi = (tx / tg) ** 0.5
+            tx = torch.trace(xxt) * ggt.shape[0]
+            tg = torch.trace(ggt) * xxt.shape[0]
+            pi = (tx / tg)
         # Regularizes and inverse
-        diag_xxt = xxt.new(xxt.shape[0]).fill_(self.eps * pi)
-        diag_ggt = ggt.new(ggt.shape[0]).fill_(self.eps / pi)
+        eps = self.eps / num_locations
+        diag_xxt = xxt.new(xxt.shape[0]).fill_((eps * pi) ** 0.5)
+        diag_ggt = ggt.new(ggt.shape[0]).fill_((eps / pi) ** 0.5)
         ixxt = (xxt + torch.diag(diag_xxt)).inverse()
         iggt = (ggt + torch.diag(diag_ggt)).inverse()
         return ixxt, iggt
