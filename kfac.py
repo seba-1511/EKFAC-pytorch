@@ -123,10 +123,8 @@ class KFAC(Optimizer):
         g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
         if bias is not None:
             gb = g[:, -1, s[2]//2, s[3]//2]
-            self._squared_fisher_norm += (bias.grad.data * gb).sum()
             bias.grad.data = gb
             g = g[:, :-1]
-        self._squared_fisher_norm += (weight.grad.data * g).sum()
         weight.grad.data = g
 
     def _compute_covs(self, group, state):

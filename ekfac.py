@@ -65,24 +65,23 @@ class EKFAC(Optimizer):
                 state = self.state[weight]
                 if (update_stats and
                         self._iteration_counter % self.update_freq == 0):
-                    # Update Stats
+                    # Update Covariances
                     if group['layer_type'] == 'Conv2d':
                         self._compute_covs_conv2d(group, state)
                     elif group['layer_type'] == 'Linear':
                         self._compute_covs_linear(group, state)
-                    # Inverses
-                    ixxt, iggt, ex, vx, eg, vg = self._inv_covs(state['xxt'],
-                                                                state['ggt'])
-                    state['ixxt'] = ixxt
-                    state['iggt'] = iggt
-                    state['vx'] = vx
+                    # Decompositions
+                    _, ex, vx = torch.svd(state['xxt'], True)
                     state['ex'] = ex
-                    state['vg'] = vg
+                    state['vx'] = vx
+                    _, eg, vg = torch.svd(state['ggt'], True)
                     state['eg'] = eg
-
+                    state['vg'] = vg
+                    # Update of initial diag elements
                     if group['layer_type'] == 'Conv2d':
                         varD = torch.ger(eg, ex).unsqueeze_(2).unsqueeze_(3)
-                        state['varD'] = varD.expand_as(weight)
+                        exp_shape = [-1, -1, weight.shape[2], weight.shape[3]]
+                        state['varD'] = varD.expand(*exp_shape)
                     elif group['layer_type'] in ['Linear']:
                         state['varD'] = torch.ger(eg, ex)
                     state['ED'] = torch.zeros_like(state['varD'])
@@ -91,16 +90,12 @@ class EKFAC(Optimizer):
                 # Preconditionning
                 if update_params:
                     if group['layer_type'] == 'Conv2d':
-                        self._precond_conv2d(weight, bias, state['ixxt'],
-                                             state['iggt'], group['mod'],
-                                             state)
+                        self._precond_conv2d(weight, bias, group['mod'], state)
                     elif group['layer_type'] == 'Linear':
-                        self._precond_linear(weight, bias, state['ixxt'],
-                                             state['iggt'], group['mod'],
-                                             state)
+                        self._precond_linear(weight, bias, group['mod'], state)
         self._iteration_counter += 1
 
-    def _precond_linear(self, weight, bias, ixxt, iggt, mod, state):
+    def _precond_linear(self, weight, bias, mod, state):
         gw = weight.grad.data
         gb = bias.grad.data
         bs = self.a_mappings[mod].shape[0]
@@ -143,7 +138,7 @@ class EKFAC(Optimizer):
         else:
             weight.grad.data = g
 
-    def _precond_conv2d(self, weight, bias, ixxt, iggt, mod, state):
+    def _precond_conv2d(self, weight, bias, mod, state):
         g = weight.grad.data
         s = g.shape
         bs = self.a_mappings[mod].shape[0]
@@ -234,20 +229,6 @@ class EKFAC(Optimizer):
         gyr = gy.data.permute(1, 0, 2, 3)
         gyr = gyr.contiguous().view(gy.shape[1], -1) * bs
         state['ggt'] = torch.mm(gyr, gyr.t()) / bs
-
-    def _inv_covs(self, xxt, ggt):
-        pi = 1.0
-        if self.pi:
-            tx = torch.trace(xxt) / float(xxt.shape[0])
-            tg = torch.trace(ggt) / float(ggt.shape[0])
-            pi = (tx / tg) ** 0.5
-        _, ex, vx = torch.svd(xxt, True)
-        dx = torch.diag(1. / (ex + self.eps * pi))
-        ixxt = torch.mm(vx, torch.mm(dx, vx.t()))
-        _, eg, vg = torch.svd(ggt, True)
-        dg = torch.diag(1. / (eg + self.eps / pi))
-        iggt = torch.mm(vg, torch.mm(dg, vg.t()))
-        return ixxt, iggt, ex, vx, eg, vg
 
     def _get_gathering_filter(self, mod):
         kw, kh = mod.kernel_size
