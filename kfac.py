@@ -28,8 +28,6 @@ class KFAC(Optimizer):
         self.update_freq = update_freq
         self.alpha = alpha
         self.params = []
-        self.a_mappings = {}
-        self.g_mappings = {}
         self._iteration_counter = 0
         for mod in net.modules():
             mod_class = mod.__class__.__name__
@@ -73,11 +71,11 @@ class KFAC(Optimizer):
 
     def _save_input(self, mod, i):
         """Saves input of layer to compute covariance."""
-        self.a_mappings[mod] = i[0]
+        self.state[mod]['x'] = i[0]
 
     def _save_grad_output(self, mod, grad_input, grad_output):
         """Saves grad on output of layer to compute covariance."""
-        self.g_mappings[mod] = grad_output[0] * grad_output[0].size(0)
+        self.state[mod]['gy'] = grad_output[0] * grad_output[0].size(0)
 
     def _precond(self, weight, bias, group, state):
         """Applies preconditioning."""
@@ -134,9 +132,8 @@ class KFAC(Optimizer):
     def _compute_covs(self, group, state):
         """Computes the covariances."""
         mod = group['mod']
-        x = self.a_mappings[group['mod']]
-        bs = x.shape[0]
-        gy = self.g_mappings[group['mod']]
+        x = self.state[group['mod']]['x']
+        gy = self.state[group['mod']]['gy']
         # Computation of xxt
         if group['layer_type'] == 'Conv2d':
             if not self.sua:
