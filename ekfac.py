@@ -1,13 +1,14 @@
 import torch
 import torch.nn.functional as F
+
 from torch.optim.optimizer import Optimizer
 
 
 class EKFAC(Optimizer):
 
-    def __init__(self, net, eps, sua=False, pi=False, update_freq=1,
-                 alpha=0.75, diag='ra'):
-        """ EKFAC Preconditionner
+    def __init__(self, net, eps, sua=False, ra=False, update_freq=1,
+                 alpha=.75):
+        """ EKFAC Preconditionner for Linear and Conv2d layers.
 
         Computes the EKFAC of the second moment of the gradients.
         It works for Linear and Conv2d layers and silently skip other layers.
@@ -15,222 +16,221 @@ class EKFAC(Optimizer):
         Args:
             net (torch.nn.Module): Network to precondition.
             eps (float): Tikhonov regularization parameter for the inverses.
-            sua (bool): Apply SUA approximation.
-            pi (bool): Computes pi correction for Tikhonov regularization.
+            sua (bool): Applies SUA approximation.
+            ra (bool): Computes stats using a running average of averaged gradients
+                instead of using a intra minibatch estimate
             update_freq (int): Perform inverses every update_freq updates.
-            alpha (float): running average coefficient
-            diag (str): compute the diagonal stats using either a running
-                        average ('ra') or the intra minibatch stats ('intra')
+            alpha (float): Running average parameter
+
         """
-        self.a_mappings = dict()
-        self.g_mappings = dict()
         self.eps = eps
-        self.sua = sua  # the code always perform SUA for now
-        self.pi = pi
+        self.sua = sua
+        self.ra = ra
         self.update_freq = update_freq
         self.alpha = alpha
-        self.diag_statistic = diag
-
         self.params = []
         self._iteration_counter = 0
-
+        if not self.ra and self.alpha != 1.:
+            raise NotImplementedError
         for mod in net.modules():
             mod_class = mod.__class__.__name__
             if mod_class in ['Linear', 'Conv2d']:
                 mod.register_forward_pre_hook(self._save_input)
                 mod.register_backward_hook(self._save_grad_output)
+                params = [mod.weight]
                 if mod.bias is not None:
-                    self.params.append(dict(params=[mod.bias, mod.weight],
-                                            mod=mod, layer_type=mod_class))
-                else:
-                    self.params.append(dict(params=[mod.weight],
-                                            mod=mod, layer_type=mod_class))
+                    params.append(mod.bias)
+                d = {'params': params, 'mod': mod, 'layer_type': mod_class}
+                if mod_class == 'Conv2d':
+                    if not self.sua:
+                        # Adding gathering filter for convolution
+                        d['gathering_filter'] = self._get_gathering_filter(mod)
+                self.params.append(d)
         super(EKFAC, self).__init__(self.params, {})
 
-    def _save_input(self, mod, i):
-        self.a_mappings[mod] = i[0].data
-
-    def _save_grad_output(self, mod, grad_input, grad_output):
-        # Note that we store the average gradient, not the sum here
-        self.g_mappings[mod] = grad_output[0].data
-
-    def step(self, update_stats=True, update_params=False):
+    def step(self, update_stats=True, update_params=True):
+        """Performs one step of preconditioning."""
         for group in self.param_groups:
-            if group['layer_type'] in ['Conv2d', 'Linear']:
-                if len(group['params']) == 2:
-                    bias, weight = group['params']
+            # Getting parameters
+            if len(group['params']) == 2:
+                weight, bias = group['params']
+            else:
+                weight = group['params'][0]
+                bias = None
+            state = self.state[weight]
+            # Update convariances and inverses
+            if self._iteration_counter % self.update_freq == 0:
+                self._compute_kfe(group, state)
+            # Preconditionning
+            if group['layer_type'] == 'Conv2d' and self.sua:
+                if self.ra:
+                    self._precond_sua_ra(weight, bias, group, state)
                 else:
-                    weight = group['params'][0]
-                    bias = None
-                state = self.state[weight]
-                if (update_stats and
-                        self._iteration_counter % self.update_freq == 0):
-                    # Update Covariances
-                    if group['layer_type'] == 'Conv2d':
-                        self._compute_covs_conv2d(group, state)
-                    elif group['layer_type'] == 'Linear':
-                        self._compute_covs_linear(group, state)
-                    # Decompositions
-                    _, ex, vx = torch.svd(state['xxt'], True)
-                    state['ex'] = ex
-                    state['vx'] = vx
-                    _, eg, vg = torch.svd(state['ggt'], True)
-                    state['eg'] = eg
-                    state['vg'] = vg
-                    # Update of initial diag elements
-                    if group['layer_type'] == 'Conv2d':
-                        varD = torch.ger(eg, ex).unsqueeze_(2).unsqueeze_(3)
-                        exp_shape = [-1, -1, weight.shape[2], weight.shape[3]]
-                        state['varD'] = varD.expand(*exp_shape)
-                    elif group['layer_type'] in ['Linear']:
-                        state['varD'] = torch.ger(eg, ex)
-                    state['ED'] = torch.zeros_like(state['varD'])
-                    state['eps'] = self.eps ** 2
-
-                # Preconditionning
-                if update_params:
-                    if group['layer_type'] == 'Conv2d':
-                        self._precond_conv2d(weight, bias, group['mod'], state)
-                    elif group['layer_type'] == 'Linear':
-                        self._precond_linear(weight, bias, group['mod'], state)
+                    raise NotImplementedError
+            else:
+                if self.ra:
+                    self._precond_ra(weight, bias, group, state)
+                else:
+                    self._precond_intra(weight, bias, group, state)
         self._iteration_counter += 1
 
-    def _precond_linear(self, weight, bias, mod, state):
-        gw = weight.grad.data
-        gb = bias.grad.data
-        bs = self.a_mappings[mod].shape[0]
-        varD = state['varD']
-        ED = state['ED']
-        v_a = state['vx']
-        v_g = state['vg']
+    def _save_input(self, mod, i):
+        """Saves input of layer to compute covariance."""
+        self.state[mod]['x'] = i[0]
 
-        g = gw
-        if bias is not None:
-            g = torch.cat([gw, gb.unsqueeze(1)], dim=1)
-        d = torch.mm(torch.mm(v_g.t(), g), v_a)  # to diag space
+    def _save_grad_output(self, mod, grad_input, grad_output):
+        """Saves grad on output of layer to compute covariance."""
+        self.state[mod]['gy'] = grad_output[0] * grad_output[0].size(0)
 
-        if self.diag_statistic == 'ra':
-            ED.mul_(self.alpha).add_(1. - self.alpha, d)  # Update RA
-            varD.mul_(self.alpha).add_((1. - self.alpha) * bs, (d - ED)**2)
-        else:
-            a_stats = self.a_mappings[mod]  # Compute M2
-            g_stats = self.g_mappings[mod] * bs
-            if bias is None:
-                a_h = a_stats
-            else:
-                ones = a_stats.new_ones((a_stats.size(0), 1))
-                a_h = torch.cat([a_stats, ones], dim=1)
-            ah_f = torch.mm(a_h, v_a)
-            g_f = torch.mm(g_stats, v_g)
-            d_m2 = torch.mm((g_f**2).transpose(1, 0), ah_f**2) / bs
-
-            ED.mul_(0)  # Update RA
-            varD.mul_(self.alpha).add_((1. - self.alpha), d_m2)
-
-        d /= varD + ED**2 + state['eps']  # inverse in diag space
-        g = torch.mm(torch.mm(v_g, d), v_a.t())  # back to origin space
-
-        if bias is not None:
-            dw = g[:, :-1]
-            db = g[:, -1]
-            bias.grad.data = db
-            weight.grad.data = dw
-        else:
-            weight.grad.data = g
-
-    def _precond_conv2d(self, weight, bias, mod, state):
+    def _precond_ra(self, weight, bias, group, state):
+        """Applies preconditioning."""
+        kfe_x = state['kfe_x']
+        kfe_gy = state['kfe_gy']
+        m2 = state['m2']
         g = weight.grad.data
         s = g.shape
-        bs = self.a_mappings[mod].shape[0]
-        varD = state['varD']
-        ED = state['ED']
-        v_a = state['vx']
-        v_g = state['vg']
-
-        # KFAC SUA
-        g = g.permute(1, 0, 2, 3)
+        bs = self.state[group['mod']]['x'].size(0)
+        if group['layer_type'] == 'Conv2d':
+            g = g.contiguous().view(s[0], s[1]*s[2]*s[3])
         if bias is not None:
-            gy = self.g_mappings[mod].data.sum(0, keepdim=True)
+            gb = bias.grad.data
+            g = torch.cat([g, gb.view(gb.shape[0], 1)], dim=1)
+        g_kfe = torch.mm(torch.mm(kfe_gy.t(), g), kfe_x)
+        m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
+        g_nat_kfe = g_kfe / (m2 + self.eps)
+        g_nat = torch.mm(torch.mm(kfe_gy, g_nat_kfe), kfe_x.t())
+        if bias is not None:
+            gb = g_nat[:, -1].contiguous().view(*bias.shape)
+            bias.grad.data = gb
+            g_nat = g_nat[:, :-1]
+        g_nat = g_nat.contiguous().view(*s)
+        weight.grad.data = g_nat
+
+    def _precond_intra(self, weight, bias, group, state):
+        """Applies preconditioning."""
+        raise NotImplementedError
+        kfe_x = state['kfe_x']
+        kfe_gy = state['kfe_gy']
+        x = state['x']
+        gy = state['gy']
+        g = weight.grad.data
+        s = g.shape
+        s_x = x.shape()
+        s_gy = gy.shape()
+        bs = state['x'].shape(0)
+        if group['layer_type'] == 'Conv2d':
+            g = g.contiguous().view(s[0], s[1]*s[2]*s[3])
+        if bias is not None:
+            gb = bias.grad.data
+            g = torch.cat([g, gb.view(gb.shape[0], 1)], dim=1)
+        # intra minibatch m2
+        x_kfe = torch.mm(x, kfe_x).view(s_x[0], -1, s_x[2], s_x[3])
+        gy_kfe = torch.mm(gy, kfe_gy).view(s_gy[0], -1, s_gy[2], s_gy[3])
+        m2 = grad_wrt_kernel(x_kfe**2, gy_kfe**2, mod.padding, mod.stride)
+        g_kfe = torch.mm(torch.mm(kfe_gy.t(), g), kfe_x)
+
+        #m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
+        g_nat_kfe = g_kfe / (m2 + self.eps)
+        g_nat = torch.mm(torch.mm(kfe_gy, g), kfe_x.t())
+        if bias is not None:
+            gb = g_nat[:, -1].contiguous().view(*bias.shape)
+            bias.grad.data = gb
+            g_nat = g_nat[:, :-1]
+        g_nat = g_nat.contiguous().view(*s)
+        weight.grad.data = g
+
+    def _precond_sua_ra(self, weight, bias, group, state):
+        """Preconditioning for KFAC SUA."""
+        raise NotImplementedError # wait for Cesar to fix the bias
+        kfe_x = state['kfe_x']
+        kfe_gy = state['kfe_gy']
+        m2 = state['m2']
+        g = weight.grad.data
+        s = g.shape
+        mod = group['mod']
+        g = g.permute(1, 0, 2, 3).contiguous()
+        if bias is not None:
+            gy = mod.y.grad.data.sum(0, keepdim=True)
             gys = gy.shape
             pool_size = (gys[2] - s[2] // 2 + mod.padding[0],
                          gys[3] - s[3] // 2 + mod.padding[1])
             # Here we compute 1 bias per spatial position of the filter!
-            gb = F.avg_pool2d(gy, kernel_size=pool_size,
-                              stride=(1, 1), padding=mod.padding,
-                              ceil_mode=False, count_include_pad=True)
+            gb = bias.grad.data
             gb *= pool_size[0] * pool_size[1]
             g = torch.cat([g, gb], dim=0)
-
-        g = g.permute(1, 0, 2, 3)
-        d = to_space_c_c(g.contiguous(), v_g, v_a)  # to diag space
-
-        if self.diag_statistic == 'ra':
-            ED.mul_(self.alpha).add_(1. - self.alpha, d)  # Update RAe
-            varD.mul_(self.alpha).add_((1. - self.alpha) * bs, (d - ED)**2)
-        else:
-            g2 = (self.g_mappings[mod] * bs)  # Compute M2
-            a = self.a_mappings[mod]
-            g_s = g2.size()
-
-            if bias is not None:
-                ones = torch.ones_like(a[:, :1, :, :])
-                a_h = torch.cat([a, ones], dim=1)
-            else:
-                a_h = a
-            a_s = a_h.size()
-            a_h_p = a_h.permute(0, 2, 3, 1).contiguous().view(-1, a_s[1])
-            a_h_p_f = torch.mm(a_h_p, v_a)  # to function space
-            a_h_f = a_h_p_f.view(a_s[0], a_s[2], a_s[3], -1)
-            a_h_f = a_h_f.permute(0, 3, 1, 2).contiguous()
-
-            g_p = g2.permute(0, 2, 3, 1).contiguous().view(-1, g_s[1])
-            g_p_f = torch.mm(g_p, v_g)  # to function space
-            g_f = g_p_f.view(g_s[0], g_s[2], g_s[3], -1)
-            g_f = g_f.permute(0, 3, 1, 2).contiguous()
-
-            d_m2 = grad_wrt_kernel(a_h_f**2, (g_f**2), mod.padding, mod.stride)
-            d_m2 /= bs
-
-            ED.mul_(0)  # Update RA
-            varD.mul_(self.alpha).add_((1. - self.alpha), d_m2)
-
-        d /= (varD + ED**2 + state['eps'])  # inverse in diag space
-        g = to_space_c_c(d.contiguous(), v_g.t(), v_a.t())  # back to origin
-
+        g = torch.mm(ixxt, g.contiguous().view(-1, s[0]*s[2]*s[3]))
+        g = g.view(-1, s[0], s[2], s[3]).permute(1, 0, 2, 3).contiguous()
+        g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
+        g /= state['num_locations']
         if bias is not None:
             gb = g[:, -1, s[2]//2, s[3]//2]
             bias.grad.data = gb
             g = g[:, :-1]
         weight.grad.data = g
 
-    def _compute_covs_linear(self, group, state):
-        gy = self.g_mappings[group['mod']]
-        x = self.a_mappings[group['mod']]
-        bs = gy.size(0)
-        x_h = x
-        if group['mod'].bias is not None:
-            ones = x.new_ones((x.size(0), 1))
-            x_h = torch.cat([x, ones], dim=1)
-        gyr = gy * bs
-        state['xxt'] = torch.mm(x_h.t(), x_h) / float(x_h.shape[0])
-        state['ggt'] = torch.mm(gyr.t(), gyr) / bs
-
-    def _compute_covs_conv2d(self, group, state):
+    def _precond_sua(self, weight, bias, group, state):
+        """Preconditioning for KFAC SUA."""
+        ixxt = state['ixxt']
+        iggt = state['iggt']
+        g = weight.grad.data
+        s = g.shape
         mod = group['mod']
-        x = self.a_mappings[group['mod']]
-        gy = self.g_mappings[group['mod']]
+        g = g.permute(1, 0, 2, 3).contiguous()
+        if bias is not None:
+            gy = mod.y.grad.data.sum(0, keepdim=True)
+            gys = gy.shape
+            pool_size = (gys[2] - s[2] // 2 + mod.padding[0],
+                         gys[3] - s[3] // 2 + mod.padding[1])
+            # Here we compute 1 bias per spatial position of the filter!
+            gb = F.avg_pool2d(gy, kernel_size=pool_size, stride=(1, 1),
+                              padding=mod.padding, ceil_mode=False,
+                              count_include_pad=True).data
+            gb *= pool_size[0] * pool_size[1]
+            g = torch.cat([g, gb], dim=0)
+        g = torch.mm(ixxt, g.contiguous().view(-1, s[0]*s[2]*s[3]))
+        g = g.view(-1, s[0], s[2], s[3]).permute(1, 0, 2, 3).contiguous()
+        g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
+        g /= state['num_locations']
+        if bias is not None:
+            gb = g[:, -1, s[2]//2, s[3]//2]
+            bias.grad.data = gb
+            g = g[:, :-1]
+        weight.grad.data = g
+
+    def _compute_kfe(self, group, state):
+        """Computes the covariances."""
+        mod = group['mod']
+        x = self.state[group['mod']]['x']
         bs = x.shape[0]
-        xr = x.data.permute(1, 0, 2, 3).contiguous().view(x.shape[1], -1)
+        gy = self.state[group['mod']]['gy']
+        # Computation of xxt
+        if group['layer_type'] == 'Conv2d':
+            if not self.sua:
+                x = F.conv2d(x, group['gathering_filter'],
+                             stride=mod.stride, padding=mod.padding,
+                             groups=mod.in_channels)
+            x = x.data.permute(1, 0, 2, 3).contiguous().view(x.shape[1], -1)
+        else:
+            x = x.data.t()
         if mod.bias is not None:
-            ones = torch.ones_like(xr[:1])
-            xr = torch.cat([xr, ones], dim=0)
-        state['xxt'] = torch.mm(xr, xr.t()) / float(xr.shape[1])
-        # Computation of ggt (same for classical KFAC and KFAC SUA)
-        gyr = gy.data.permute(1, 0, 2, 3)
-        gyr = gyr.contiguous().view(gy.shape[1], -1) * bs
-        state['ggt'] = torch.mm(gyr, gyr.t()) / bs
+            ones = torch.ones_like(x[:1])
+            x = torch.cat([x, ones], dim=0)
+        xxt = torch.mm(x, x.t()) / float(x.shape[1])
+        _, Ex, state['kfe_x'] = torch.svd(xxt)
+        # Computation of ggt
+        if group['layer_type'] == 'Conv2d':
+            gy = gy.data.permute(1, 0, 2, 3)
+            state['num_locations'] = gy.shape[2] * gy.shape[3]
+            gy = gy.contiguous().view(gy.shape[0], -1)
+        else:
+            gy = gy.data.t()
+            state['num_locations'] = 1
+        ggt = torch.mm(gy, gy.t()) / float(gy.shape[1])
+        _, Eg, state['kfe_gy'] = torch.svd(ggt)
+        state['m2'] = Eg.unsqueeze(1) * Ex.unsqueeze(0) * state['num_locations']
 
     def _get_gathering_filter(self, mod):
+        """Convolution filter that extracts input patches."""
         kw, kh = mod.kernel_size
         g_filter = mod.weight.data.new(kw * kh * mod.in_channels, 1, kw, kh)
         g_filter.fill_(0)
@@ -239,16 +239,6 @@ class EKFAC(Optimizer):
                 for k in range(kh):
                     g_filter[k + kh*j + kw*kh*i, 0, j, k] = 1
         return g_filter
-
-
-def to_space_c_c(x, va, vb):
-    # change space version channel/channel
-    sx = x.size()
-    x = torch.mm(va.t(), x.view(sx[0], -1))
-    x = x.view(va.shape[1], sx[1], sx[2], sx[3])
-    x = torch.mm(x.permute(0, 2, 3, 1).contiguous().view(-1, sx[1]), vb)
-    x = x.view(va.shape[1], sx[2], sx[3], vb.shape[1]).permute(0, 3, 1, 2)
-    return x
 
 
 def grad_wrt_kernel(a, g, padding, stride, target_size=None):
