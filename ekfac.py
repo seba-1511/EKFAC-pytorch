@@ -209,7 +209,6 @@ class EKFAC(Optimizer):
             ones = torch.ones_like(x[:1])
             x = torch.cat([x, ones], dim=0)
         xxt = torch.mm(x, x.t()) / float(x.shape[1])
-        #_, Ex, state['kfe_x'] = torch.svd(xxt)
         Ex, state['kfe_x'] = torch.symeig(xxt, eigenvectors=True)
         # Computation of ggt
         if group['layer_type'] == 'Conv2d':
@@ -220,7 +219,7 @@ class EKFAC(Optimizer):
             gy = gy.data.t()
             state['num_locations'] = 1
         ggt = torch.mm(gy, gy.t()) / float(gy.shape[1])
-        _, Eg, state['kfe_gy'] = torch.svd(ggt)
+        Eg, state['kfe_gy'] = torch.symeig(ggt, eigenvectors=True)
         state['m2'] = Eg.unsqueeze(1) * Ex.unsqueeze(0) * state['num_locations']
         if group['layer_type'] == 'Conv2d' and self.sua:
             ws = group['params'][0].grad.data.size()
