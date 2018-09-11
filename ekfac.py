@@ -141,32 +141,26 @@ class EKFAC(Optimizer):
 
     def _precond_sua_ra(self, weight, bias, group, state):
         """Preconditioning for KFAC SUA."""
-        raise NotImplementedError # wait for Cesar to fix the bias
         kfe_x = state['kfe_x']
         kfe_gy = state['kfe_gy']
         m2 = state['m2']
         g = weight.grad.data
         s = g.shape
+        bs = self.state[group['mod']]['x'].size(0)
         mod = group['mod']
-        g = g.permute(1, 0, 2, 3).contiguous()
         if bias is not None:
-            gy = mod.y.grad.data.sum(0, keepdim=True)
-            gys = gy.shape
-            pool_size = (gys[2] - s[2] // 2 + mod.padding[0],
-                         gys[3] - s[3] // 2 + mod.padding[1])
-            # Here we compute 1 bias per spatial position of the filter!
-            gb = bias.grad.data
-            gb *= pool_size[0] * pool_size[1]
-            g = torch.cat([g, gb], dim=0)
-        g = torch.mm(ixxt, g.contiguous().view(-1, s[0]*s[2]*s[3]))
-        g = g.view(-1, s[0], s[2], s[3]).permute(1, 0, 2, 3).contiguous()
-        g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
-        g /= state['num_locations']
+            gb = bias.grad.view(-1, 1, 1, 1).expand(-1, -1, s[2], s[3])
+            g = torch.cat([g, gb], dim=1)
+
+        g_kfe = self._to_kfe_sua(g, kfe_x, kfe_gy)
+        m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
+        g_nat_kfe = g_kfe / (m2 + self.eps)
+        g_nat = self._to_kfe_sua(g_nat_kfe, kfe_x.t(), kfe_gy.t())
         if bias is not None:
-            gb = g[:, -1, s[2]//2, s[3]//2]
+            gb = g_nat[:, -1, s[2]//2, s[3]//2]
             bias.grad.data = gb
-            g = g[:, :-1]
-        weight.grad.data = g
+            g_nat = g_nat[:, :-1]
+        weight.grad.data = g_nat
 
     def _precond_sua(self, weight, bias, group, state):
         """Preconditioning for KFAC SUA."""
@@ -201,7 +195,6 @@ class EKFAC(Optimizer):
         """Computes the covariances."""
         mod = group['mod']
         x = self.state[group['mod']]['x']
-        bs = x.shape[0]
         gy = self.state[group['mod']]['gy']
         # Computation of xxt
         if group['layer_type'] == 'Conv2d':
@@ -216,7 +209,8 @@ class EKFAC(Optimizer):
             ones = torch.ones_like(x[:1])
             x = torch.cat([x, ones], dim=0)
         xxt = torch.mm(x, x.t()) / float(x.shape[1])
-        _, Ex, state['kfe_x'] = torch.svd(xxt)
+        #_, Ex, state['kfe_x'] = torch.svd(xxt)
+        Ex, state['kfe_x'] = torch.symeig(xxt, eigenvectors=True)
         # Computation of ggt
         if group['layer_type'] == 'Conv2d':
             gy = gy.data.permute(1, 0, 2, 3)
@@ -228,6 +222,9 @@ class EKFAC(Optimizer):
         ggt = torch.mm(gy, gy.t()) / float(gy.shape[1])
         _, Eg, state['kfe_gy'] = torch.svd(ggt)
         state['m2'] = Eg.unsqueeze(1) * Ex.unsqueeze(0) * state['num_locations']
+        if group['layer_type'] == 'Conv2d' and self.sua:
+            ws = group['params'][0].grad.data.size()
+            state['m2'] = state['m2'].view(Eg.size(0), Ex.size(0), 1, 1).expand(-1, -1, ws[2], ws[3])
 
     def _get_gathering_filter(self, mod):
         """Convolution filter that extracts input patches."""
@@ -239,6 +236,14 @@ class EKFAC(Optimizer):
                 for k in range(kh):
                     g_filter[k + kh*j + kw*kh*i, 0, j, k] = 1
         return g_filter
+
+    def _to_kfe_sua(self, g, vx, vg):
+        """Project g to the kfe"""
+        sg = g.size()
+        g = torch.mm(vg.t(), g.view(sg[0], -1)).view(vg.size(1), sg[1], sg[2], sg[3])
+        g = torch.mm(g.permute(0, 2, 3, 1).contiguous().view(-1, sg[1]), vx)
+        g = g.view(vg.size(1), sg[2], sg[3], vx.size(1)).permute(0, 3, 1, 2)
+        return g
 
 
 def grad_wrt_kernel(a, g, padding, stride, target_size=None):
