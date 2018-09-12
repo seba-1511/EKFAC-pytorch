@@ -66,7 +66,7 @@ class EKFAC(Optimizer):
                 if self.ra:
                     self._precond_sua_ra(weight, bias, group, state)
                 else:
-                    raise NotImplementedError
+                    self._precond_intra_sua(weight, bias, group, state)
             else:
                 if self.ra:
                     self._precond_ra(weight, bias, group, state)
@@ -139,9 +139,9 @@ class EKFAC(Optimizer):
                 g_this = torch.mm(gy_kfe[i].view(s_gy[1], -1),
                                   x_kfe[i].permute(1, 2, 0).view(-1, s_x[1]+s_cin))
                 m2 += g_this**2
-                g_kfe += g_this
             m2 /= bs
-            g_kfe /= bs
+            g_kfe = torch.mm(gy_kfe.permute(1, 0, 2, 3).view(s_gy[1], -1),
+                             x_kfe.permute(0, 2, 3, 1).contiguous().view(-1, s_x[1]+s_cin)) / bs
             ## sanity check did we obtain the same grad ?
             # g = torch.mm(torch.mm(kfe_gy, g_kfe), kfe_x.t())
             # gb = g[:,-1]
@@ -186,7 +186,6 @@ class EKFAC(Optimizer):
         if bias is not None:
             gb = bias.grad.view(-1, 1, 1, 1).expand(-1, -1, s[2], s[3])
             g = torch.cat([g, gb], dim=1)
-
         g_kfe = self._to_kfe_sua(g, kfe_x, kfe_gy)
         m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
         g_nat_kfe = g_kfe / (m2 + self.eps)
@@ -197,34 +196,49 @@ class EKFAC(Optimizer):
             g_nat = g_nat[:, :-1]
         weight.grad.data = g_nat
 
-    def _precond_sua(self, weight, bias, group, state):
+    def _precond_intra_sua(self, weight, bias, group, state):
         """Preconditioning for KFAC SUA."""
-        ixxt = state['ixxt']
-        iggt = state['iggt']
+        kfe_x = state['kfe_x']
+        kfe_gy = state['kfe_gy']
+        mod = group['mod']
+        x = self.state[mod]['x']
+        gy = self.state[mod]['gy']
         g = weight.grad.data
         s = g.shape
-        mod = group['mod']
-        g = g.permute(1, 0, 2, 3).contiguous()
+        s_x = x.size()
+        s_gy = gy.size()
+        s_cin = 0
+        bs = x.size(0)
         if bias is not None:
-            gy = mod.y.grad.data.sum(0, keepdim=True)
-            gys = gy.shape
-            pool_size = (gys[2] - s[2] // 2 + mod.padding[0],
-                         gys[3] - s[3] // 2 + mod.padding[1])
-            # Here we compute 1 bias per spatial position of the filter!
-            gb = F.avg_pool2d(gy, kernel_size=pool_size, stride=(1, 1),
-                              padding=mod.padding, ceil_mode=False,
-                              count_include_pad=True).data
-            gb *= pool_size[0] * pool_size[1]
-            g = torch.cat([g, gb], dim=0)
-        g = torch.mm(ixxt, g.contiguous().view(-1, s[0]*s[2]*s[3]))
-        g = g.view(-1, s[0], s[2], s[3]).permute(1, 0, 2, 3).contiguous()
-        g = torch.mm(iggt, g.view(s[0], -1)).view(s[0], -1, s[2], s[3])
-        g /= state['num_locations']
+            ones = torch.ones_like(x[:,:1])
+            x = torch.cat([x, ones], dim=1)
+            s_cin += 1
+        # intra minibatch m2
+        x = x.permute(1, 0, 2, 3).contiguous().view(s_x[1]+s_cin, -1)
+        x_kfe = torch.mm(kfe_x.t(), x).view(s_x[1]+s_cin, -1, s_x[2], s_x[3]).permute(1, 0, 2, 3)
+        gy = gy.permute(1, 0, 2, 3).contiguous().view(s_gy[1], -1)
+        gy_kfe = torch.mm(kfe_gy.t(), gy).view(s_gy[1], -1, s_gy[2], s_gy[3]).permute(1, 0, 2, 3)
+        m2 = torch.zeros((s[0], s[1]+s_cin, s[2], s[3]), device=g.device)
+        g_kfe = torch.zeros((s[0], s[1]+s_cin, s[2], s[3]), device=g.device)
+        for i in range(x_kfe.size(0)):
+            g_this = grad_wrt_kernel(x_kfe[i:i+1], gy_kfe[i:i+1], mod.padding, mod.stride)
+            m2 += g_this**2
+        m2 /= bs
+        g_kfe = grad_wrt_kernel(x_kfe, gy_kfe, mod.padding, mod.stride) / bs
+        ## sanity check did we obtain the same grad ?
+        # g = self._to_kfe_sua(g_kfe, kfe_x.t(), kfe_gy.t())
+        # gb = g[:, -1, s[2]//2, s[3]//2]
+        # gw = g[:,:-1].view(*s)
+        # print('bias', torch.dist(gb, bias.grad.data))
+        # print('weight', torch.dist(gw, weight.grad.data))
+        ## end sanity check
+        g_nat_kfe = g_kfe / (m2 + self.eps)
+        g_nat = self._to_kfe_sua(g_nat_kfe, kfe_x.t(), kfe_gy.t())
         if bias is not None:
-            gb = g[:, -1, s[2]//2, s[3]//2]
+            gb = g_nat[:, -1, s[2]//2, s[3]//2]
             bias.grad.data = gb
-            g = g[:, :-1]
-        weight.grad.data = g
+            g_nat = g_nat[:, :-1]
+        weight.grad.data = g_nat
 
     def _compute_kfe(self, group, state):
         """Computes the covariances."""
