@@ -108,36 +108,71 @@ class EKFAC(Optimizer):
 
     def _precond_intra(self, weight, bias, group, state):
         """Applies preconditioning."""
-        raise NotImplementedError
         kfe_x = state['kfe_x']
         kfe_gy = state['kfe_gy']
-        x = state['x']
-        gy = state['gy']
+        mod = group['mod']
+        x = self.state[mod]['x']
+        gy = self.state[mod]['gy']
         g = weight.grad.data
         s = g.shape
-        s_x = x.shape()
-        s_gy = gy.shape()
-        bs = state['x'].shape(0)
+        s_x = x.size()
+        s_cin = 0
+        s_gy = gy.size()
+        bs = x.size(0)
         if group['layer_type'] == 'Conv2d':
-            g = g.contiguous().view(s[0], s[1]*s[2]*s[3])
-        if bias is not None:
-            gb = bias.grad.data
-            g = torch.cat([g, gb.view(gb.shape[0], 1)], dim=1)
-        # intra minibatch m2
-        x_kfe = torch.mm(x, kfe_x).view(s_x[0], -1, s_x[2], s_x[3])
-        gy_kfe = torch.mm(gy, kfe_gy).view(s_gy[0], -1, s_gy[2], s_gy[3])
-        m2 = grad_wrt_kernel(x_kfe**2, gy_kfe**2, mod.padding, mod.stride)
-        g_kfe = torch.mm(torch.mm(kfe_gy.t(), g), kfe_x)
-
-        #m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
-        g_nat_kfe = g_kfe / (m2 + self.eps)
-        g_nat = torch.mm(torch.mm(kfe_gy, g), kfe_x.t())
-        if bias is not None:
-            gb = g_nat[:, -1].contiguous().view(*bias.shape)
-            bias.grad.data = gb
-            g_nat = g_nat[:, :-1]
-        g_nat = g_nat.contiguous().view(*s)
-        weight.grad.data = g
+            x = F.conv2d(x, group['gathering_filter'],
+                         stride=mod.stride, padding=mod.padding,
+                         groups=mod.in_channels)
+            s_x = x.size()
+            x = x.data.permute(1, 0, 2, 3).contiguous().view(x.shape[1], -1)
+            if mod.bias is not None:
+                ones = torch.ones_like(x[:1])
+                x = torch.cat([x, ones], dim=0)
+                s_cin = 1 # adding a channel in dim for the bias
+            # intra minibatch m2
+            x_kfe = torch.mm(kfe_x.t(), x).view(s_x[1]+s_cin, -1, s_x[2], s_x[3]).permute(1, 0, 2, 3)
+            gy = gy.permute(1, 0, 2, 3).contiguous().view(s_gy[1], -1)
+            gy_kfe = torch.mm(kfe_gy.t(), gy).view(s_gy[1], -1, s_gy[2], s_gy[3]).permute(1, 0, 2, 3)
+            m2 = torch.zeros((s[0], s[1]*s[2]*s[3]+s_cin), device=g.device)
+            g_kfe = torch.zeros((s[0], s[1]*s[2]*s[3]+s_cin), device=g.device)
+            for i in range(x_kfe.size(0)):
+                g_this = torch.mm(gy_kfe[i].view(s_gy[1], -1),
+                                  x_kfe[i].permute(1, 2, 0).view(-1, s_x[1]+s_cin))
+                m2 += g_this**2
+                g_kfe += g_this
+            m2 /= bs
+            g_kfe /= bs
+            ## sanity check did we obtain the same grad ?
+            # g = torch.mm(torch.mm(kfe_gy, g_kfe), kfe_x.t())
+            # gb = g[:,-1]
+            # gw = g[:,:-1].view(*s)
+            # print('bias', torch.dist(gb, bias.grad.data))
+            # print('weight', torch.dist(gw, weight.grad.data))
+            ## end sanity check
+            g_nat_kfe = g_kfe / (m2 + self.eps)
+            g_nat = torch.mm(torch.mm(kfe_gy, g_nat_kfe), kfe_x.t())
+            if bias is not None:
+                gb = g_nat[:, -1].contiguous().view(*bias.shape)
+                bias.grad.data = gb
+                g_nat = g_nat[:, :-1]
+            g_nat = g_nat.contiguous().view(*s)
+            weight.grad.data = g_nat
+        else:
+            if bias is not None:
+                ones = torch.ones_like(x[:, :1])
+                x = torch.cat([x, ones], dim=1)
+            x_kfe = torch.mm(x, kfe_x)
+            gy_kfe = torch.mm(gy, kfe_gy)
+            m2 = torch.mm(gy_kfe.t()**2, x_kfe**2) / bs
+            g_kfe = torch.mm(gy_kfe.t(), x_kfe) / bs
+            g_nat_kfe = g_kfe / (m2 + self.eps)
+            g_nat = torch.mm(torch.mm(kfe_gy, g_nat_kfe), kfe_x.t())
+            if bias is not None:
+                gb = g_nat[:, -1].contiguous().view(*bias.shape)
+                bias.grad.data = gb
+                g_nat = g_nat[:, :-1]
+            g_nat = g_nat.contiguous().view(*s)
+            weight.grad.data = g
 
     def _precond_sua_ra(self, weight, bias, group, state):
         """Preconditioning for KFAC SUA."""
