@@ -95,10 +95,10 @@ class EKFAC(Optimizer):
         if bias is not None:
             gb = bias.grad.data
             g = torch.cat([g, gb.view(gb.shape[0], 1)], dim=1)
-        g_kfe = torch.mm(torch.mm(kfe_gy.t(), g), kfe_x)
+        g_kfe = matmul3(kfe_gy.t(), g, kfe_x)
         m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
         g_nat_kfe = g_kfe / (m2 + self.eps)
-        g_nat = torch.mm(torch.mm(kfe_gy, g_nat_kfe), kfe_x.t())
+        g_nat = matmul3(kfe_gy, g_nat_kfe, kfe_x.t())
         if bias is not None:
             gb = g_nat[:, -1].contiguous().view(*bias.shape)
             bias.grad.data = gb
@@ -130,18 +130,17 @@ class EKFAC(Optimizer):
                 x = torch.cat([x, ones], dim=0)
                 s_cin = 1 # adding a channel in dim for the bias
             # intra minibatch m2
-            x_kfe = torch.mm(kfe_x.t(), x).view(s_x[1]+s_cin, -1, s_x[2], s_x[3]).permute(1, 0, 2, 3)
+            x_kfe = torch.mm(kfe_x.t(), x).view(-1, s_x[0], s_x[2], s_x[3]).permute(1, 0, 2, 3)
             gy = gy.permute(1, 0, 2, 3).contiguous().view(s_gy[1], -1)
             gy_kfe = torch.mm(kfe_gy.t(), gy).view(s_gy[1], -1, s_gy[2], s_gy[3]).permute(1, 0, 2, 3)
-            m2 = torch.zeros((s[0], s[1]*s[2]*s[3]+s_cin), device=g.device)
-            g_kfe = torch.zeros((s[0], s[1]*s[2]*s[3]+s_cin), device=g.device)
+            m2 = torch.zeros((s[0], x_kfe.size(1)), device=g.device)
+            g_kfe = torch.zeros((s[0], x_kfe.size(1)), device=g.device)
             for i in range(x_kfe.size(0)):
-                g_this = torch.mm(gy_kfe[i].view(s_gy[1], -1),
-                                  x_kfe[i].permute(1, 2, 0).view(-1, s_x[1]+s_cin))
-                m2 += g_this**2
+                m2 += torch.mm(gy_kfe[i].view(s_gy[1], -1),
+                               x_kfe[i].permute(1, 2, 0).view(-1, x_kfe.size(1)))**2
             m2 /= bs
             g_kfe = torch.mm(gy_kfe.permute(1, 0, 2, 3).view(s_gy[1], -1),
-                             x_kfe.permute(0, 2, 3, 1).contiguous().view(-1, s_x[1]+s_cin)) / bs
+                             x_kfe.permute(0, 2, 3, 1).contiguous().view(-1, x_kfe.size(1))) / bs
             ## sanity check did we obtain the same grad ?
             # g = torch.mm(torch.mm(kfe_gy, g_kfe), kfe_x.t())
             # gb = g[:,-1]
@@ -150,7 +149,7 @@ class EKFAC(Optimizer):
             # print('weight', torch.dist(gw, weight.grad.data))
             ## end sanity check
             g_nat_kfe = g_kfe / (m2 + self.eps)
-            g_nat = torch.mm(torch.mm(kfe_gy, g_nat_kfe), kfe_x.t())
+            g_nat = matmul3(kfe_gy, g_nat_kfe, kfe_x.t())
             if bias is not None:
                 gb = g_nat[:, -1].contiguous().view(*bias.shape)
                 bias.grad.data = gb
@@ -186,10 +185,20 @@ class EKFAC(Optimizer):
         if bias is not None:
             gb = bias.grad.view(-1, 1, 1, 1).expand(-1, -1, s[2], s[3])
             g = torch.cat([g, gb], dim=1)
-        g_kfe = self._to_kfe_sua(g, kfe_x, kfe_gy)
+
+        vx = kfe_x; vg = kfe_gy
+        sg = g.size()
+        g = torch.mm(vg.t(), g.view(sg[0], -1)).view(vg.size(1), sg[1], sg[2], sg[3])
+        g = torch.mm(vx.t(), g.permute(1, 0, 2, 3).contiguous().view(sg[1], -1))
+        g_kfe = g.view(vx.size(1), vg.size(1), sg[2], sg[3])
+
         m2.mul_(self.alpha).add_((1. - self.alpha) * bs, g_kfe**2)
         g_nat_kfe = g_kfe / (m2 + self.eps)
-        g_nat = self._to_kfe_sua(g_nat_kfe, kfe_x.t(), kfe_gy.t())
+
+        vx = kfe_x.t(); vg = kfe_gy.t()
+        g = torch.mm(vx.t(), g_nat_kfe.view(sg[1], -1)).view(vg.size(1), sg[1], sg[2], sg[3])
+        g_nat = torch.mm(vg.t(), g.permute(1, 0, 2, 3).contiguous().view(sg[0], -1)).view(*sg)
+
         if bias is not None:
             gb = g_nat[:, -1, s[2]//2, s[3]//2]
             bias.grad.data = gb
@@ -221,8 +230,7 @@ class EKFAC(Optimizer):
         m2 = torch.zeros((s[0], s[1]+s_cin, s[2], s[3]), device=g.device)
         g_kfe = torch.zeros((s[0], s[1]+s_cin, s[2], s[3]), device=g.device)
         for i in range(x_kfe.size(0)):
-            g_this = grad_wrt_kernel(x_kfe[i:i+1], gy_kfe[i:i+1], mod.padding, mod.stride)
-            m2 += g_this**2
+            m2 += grad_wrt_kernel(x_kfe[i:i+1], gy_kfe[i:i+1], mod.padding, mod.stride)**2
         m2 /= bs
         g_kfe = grad_wrt_kernel(x_kfe, gy_kfe, mod.padding, mod.stride) / bs
         ## sanity check did we obtain the same grad ?
@@ -257,8 +265,7 @@ class EKFAC(Optimizer):
         if mod.bias is not None:
             ones = torch.ones_like(x[:1])
             x = torch.cat([x, ones], dim=0)
-        xxt = torch.mm(x, x.t()) / float(x.shape[1])
-        Ex, state['kfe_x'] = torch.symeig(xxt, eigenvectors=True)
+        Ex, state['kfe_x'] = decompose(x)
         # Computation of ggt
         if group['layer_type'] == 'Conv2d':
             gy = gy.data.permute(1, 0, 2, 3)
@@ -267,12 +274,11 @@ class EKFAC(Optimizer):
         else:
             gy = gy.data.t()
             state['num_locations'] = 1
-        ggt = torch.mm(gy, gy.t()) / float(gy.shape[1])
-        Eg, state['kfe_gy'] = torch.symeig(ggt, eigenvectors=True)
+        Eg, state['kfe_gy'] = decompose(gy)
         state['m2'] = Eg.unsqueeze(1) * Ex.unsqueeze(0) * state['num_locations']
         if group['layer_type'] == 'Conv2d' and self.sua:
             ws = group['params'][0].grad.data.size()
-            state['m2'] = state['m2'].view(Eg.size(0), Ex.size(0), 1, 1).expand(-1, -1, ws[2], ws[3])
+            state['m2'] = state['m2'].t().view(Ex.size(0), Eg.size(0), 1, 1).expand(-1, -1, ws[2], ws[3]).contiguous()
 
     def _get_gathering_filter(self, mod):
         """Convolution filter that extracts input patches."""
@@ -289,10 +295,29 @@ class EKFAC(Optimizer):
         """Project g to the kfe"""
         sg = g.size()
         g = torch.mm(vg.t(), g.view(sg[0], -1)).view(vg.size(1), sg[1], sg[2], sg[3])
-        g = torch.mm(g.permute(0, 2, 3, 1).contiguous().view(-1, sg[1]), vx)
-        g = g.view(vg.size(1), sg[2], sg[3], vx.size(1)).permute(0, 3, 1, 2)
+        g = torch.mm(vx.t(), g.permute(1, 0, 2, 3).contiguous().view(sg[1], -1))
+        g = g.view(vx.size(1), vg.size(1), sg[2], sg[3]).permute(1, 0, 2, 3)
+        # g = torch.mm(vg.t(), g.view(sg[0], -1)).view(vg.size(1), sg[1], sg[2], sg[3])
+        # g = torch.mm(g.permute(0, 2, 3, 1).contiguous().view(-1, sg[1]), vx)
+        # g = g.view(vg.size(1), sg[2], sg[3], vx.size(1)).permute(0, 3, 1, 2)
         return g
 
+def decompose(X):
+    if X.size(1) < X.size(0):
+        evec, d, _ = torch.svd(X, some=True)
+        return d**2 / X.size(0), evec
+    else:
+        xxt = torch.mm(X, X.t()) / float(X.size(1))
+        d, evec = torch.symeig(xxt, eigenvectors=True)
+        return d, evec
+
+
+
+def matmul3(A, B, C):
+    if (A.size(0)*A.size(1)*B.size(1) + A.size(0)*B.size(1)*C.size(1) <
+            B.size(0)*B.size(1)*C.size(1) + A.size(0)*B.size(0)*C.size(1)):
+        return torch.mm(torch.mm(A, B), C)
+    return torch.mm(A, torch.mm(B, C))
 
 def grad_wrt_kernel(a, g, padding, stride, target_size=None):
     gk = F.conv2d(a.transpose(0, 1), g.transpose(0, 1).contiguous(),
