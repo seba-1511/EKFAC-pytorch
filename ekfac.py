@@ -305,7 +305,7 @@ class EKFAC(Optimizer):
 def decompose(X):
     if X.size(1) < X.size(0):
         evec, d, _ = torch.svd(X, some=True)
-        return d**2 / X.size(0), evec
+        return d**2 / X.size(1), evec
     else:
         xxt = torch.mm(X, X.t()) / float(X.size(1))
         d, evec = torch.symeig(xxt, eigenvectors=True)
